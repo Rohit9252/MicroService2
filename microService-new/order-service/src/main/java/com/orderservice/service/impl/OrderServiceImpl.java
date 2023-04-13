@@ -3,11 +3,15 @@ package com.orderservice.service.impl;
 import com.orderservice.dtos.InventoryResponse;
 import com.orderservice.dtos.OrderLineItemsDto;
 import com.orderservice.dtos.OrderRequest;
+import com.orderservice.events.OrderPlacedEvent;
 import com.orderservice.model.Order;
 import com.orderservice.model.OrderLineItems;
 import com.orderservice.repository.OrderRepository;
 import com.orderservice.service.OrderService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cloud.sleuth.Span;
+import org.springframework.cloud.sleuth.Tracer;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -23,6 +27,8 @@ public class OrderServiceImpl implements OrderService {
 
     private final OrderRepository orderRepository;
     private final WebClient.Builder webClientBuilder;
+    private final Tracer tracer;
+    private final KafkaTemplate<String, OrderPlacedEvent> kafkaTemplate;
 
     @Override
     public String placeOrder(OrderRequest orderRequest) {
@@ -42,25 +48,33 @@ public class OrderServiceImpl implements OrderService {
                                                     .map(OrderLineItems::getSkuCode)
                                                     .collect(Collectors.toList());
 
-       InventoryResponse[] inventoryResponses =  webClientBuilder.build().get()
-                        .uri("http://inventory-service/api/inventory",
-                                uriBuilder -> uriBuilder.queryParam("skuCode", skuCodes).build() ) // passing the Request Parameter with this Method
-                                .retrieve()
-                                        .bodyToMono(InventoryResponse[].class) // for which response you will Get after calling the Api
-                                                .block(); // for synchronized call
-        // before  getting the result this will not go Ahead from this line
+        Span inventoryServiceLookup = tracer.nextSpan().name("InventoryServiceLookup");
+
+        try(Tracer.SpanInScope spanInScope = tracer.withSpan(inventoryServiceLookup.start())){
+            InventoryResponse[] inventoryResponses =  webClientBuilder.build().get()
+                    .uri("http://inventory-service/api/inventory",
+                            uriBuilder -> uriBuilder.queryParam("skuCode", skuCodes).build() ) // passing the Request Parameter with this Method
+                    .retrieve()
+                    .bodyToMono(InventoryResponse[].class) // for which response you will Get after calling the Api
+                    .block(); // for synchronized call
+            // before  getting the result this will not go Ahead from this line
 
 
-       boolean  result =  Arrays.stream(inventoryResponses).
-                            allMatch(InventoryResponse::getIsInStock);
+            boolean  result =  Arrays.stream(inventoryResponses).
+                    allMatch(InventoryResponse::getIsInStock);
 
-       if(result){
-           orderRepository.save(order);
-           return "Order Placed";
+            if(result){
+                orderRepository.save(order);
+                kafkaTemplate.send("notificationTopic", new OrderPlacedEvent(order.getOrderNumber()));
+                return "Order Placed";
+            }else{
+                throw new RuntimeException("Stock is Not present, Please Try Again After Some Time");
+            }
 
-       }else{
-           throw new RuntimeException("Stock is Not present, Please Try Again After Some Time");
-       }
+        }finally {
+            inventoryServiceLookup.end();
+        }
+
 
 
     }
